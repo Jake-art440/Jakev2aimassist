@@ -1,0 +1,1027 @@
+--[[
+	AimAssistTest v2 (LocalScript)
+	Local: StarterPlayer > StarterPlayerScripts
+
+	Teste de mira assistida + "Clean Game" para o SEU próprio jogo (ambiente de desenvolvimento).
+	Alvos válidos: players E bonecos (qualquer Model com Humanoid no Workspace).
+
+	Seções:
+	  1. Config
+	  2. Estados (um por função)
+	  3. FovCalculator    - projeção na tela, distância ao centro, raio em graus
+	  4. TargetRegistry   - registro de Humanoids (players + NPCs), sem varrer o mapa a cada frame
+	  5. TargetSelector   - parte do corpo, validação, FOV de seleção, parede
+	  6. CameraController - rotação suave da câmera (Aim Lock)
+	  7. CameraFov        - FOV visual da câmera (independente do raio de seleção)
+	  8. CleanGame        - otimizações visuais reversíveis
+	  9. ControlPanel     - interface
+	 10. Main             - liga tudo
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local CollectionService = game:GetService("CollectionService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+--------------------------------------------------------------------------------
+-- 1. CONFIG
+--------------------------------------------------------------------------------
+local Config = {
+	-- FOV de SELEÇÃO (círculo na tela, em pixels). Não tem relação com o FOV da câmera.
+	MinRadius = 40,
+	MaxRadius = 400,
+	DefaultRadius = 140,
+	MaxDistance = 1000, -- studs
+
+	-- Quem pode ser alvo
+	TargetPlayers = true,
+	TargetNPCs = true, -- bonecos de teste: qualquer Model com Humanoid que não seja player
+	IgnoreTeammates = false,
+
+	WallCheck = true,       -- ignora alvos atrás de paredes
+	SwitchThreshold = 0.75, -- histerese: só troca de alvo se o novo estiver bem mais perto do centro
+
+	-- Câmera do Aim Lock (0 = rápido, 1 = suave)
+	DefaultSmoothness = 0.6,
+	FastSpeed = 30,
+	SlowSpeed = 3,
+	MaxTurnDegPerSecond = 900,
+	DeadzoneDeg = 0.15,
+
+	-- FOV VISUAL da câmera (graus). Independente do raio de seleção.
+	MinCameraFov = 60,
+	MaxCameraFov = 110,
+
+	ToggleKey = Enum.KeyCode.Q,
+	PanelWidth = 230,
+	Debug = false, -- true: imprime no Output quando o alvo muda
+
+	Clean = {
+		KeepFxTag = "KeepFX", -- marque com CollectionService efeitos que o Clean Game NÃO deve desligar
+		SweepBatch = 300,     -- instâncias processadas por frame na varredura inicial
+		MobileQuality = Enum.QualityLevel.Level03,
+		DesktopQuality = Enum.QualityLevel.Level05,
+	},
+}
+
+--------------------------------------------------------------------------------
+-- 2. ESTADOS (separados por função)
+--------------------------------------------------------------------------------
+local AimState = {
+	Enabled = false,
+	PartIndex = 1,
+	Smoothness = Config.DefaultSmoothness,
+	TargetModel = nil,
+	TargetPlayer = nil,
+	TargetPos = nil,
+	UsedFallback = false,
+}
+
+local FovState = {
+	Enabled = true,
+	Radius = Config.DefaultRadius,
+}
+
+local CleanState = {
+	Enabled = false,
+}
+
+local CameraFovState = {
+	Original = 70,
+	Value = 70,
+	Active = false,
+}
+
+local SelectionStats = { Candidates = 0, InFov = 0 }
+
+--------------------------------------------------------------------------------
+-- 3. FOV CALCULATOR
+--------------------------------------------------------------------------------
+local FovCalculator = {}
+
+-- Posição 2D (pixels) de um ponto do mundo; nil se estiver fora da tela ou atrás da câmera.
+function FovCalculator.screenPosition(camera, worldPosition)
+	local point, onScreen = camera:WorldToViewportPoint(worldPosition)
+	if not onScreen or point.Z <= 0 then
+		return nil
+	end
+	return Vector2.new(point.X, point.Y)
+end
+
+-- Distância (pixels) do ponto ao centro da tela (centro do círculo de FOV).
+function FovCalculator.distanceFromCenter(camera, worldPosition)
+	local screenPos = FovCalculator.screenPosition(camera, worldPosition)
+	if not screenPos then
+		return nil
+	end
+	return (screenPos - camera.ViewportSize / 2).Magnitude
+end
+
+-- Converte o raio em pixels para graus (depende do FOV da câmera) - só para exibição.
+function FovCalculator.radiusToDegrees(camera, radiusPixels)
+	local halfFov = math.rad(camera.FieldOfView) / 2
+	local focal = (camera.ViewportSize.Y / 2) / math.tan(halfFov)
+	return math.deg(math.atan(radiusPixels / focal))
+end
+
+--------------------------------------------------------------------------------
+-- 4. TARGET REGISTRY (players + NPCs)
+--------------------------------------------------------------------------------
+local TargetRegistry = {}
+local humanoids = setmetatable({}, { __mode = "k" })
+
+function TargetRegistry.add(humanoid)
+	humanoids[humanoid] = true
+end
+
+function TargetRegistry.remove(humanoid)
+	humanoids[humanoid] = nil
+end
+
+function TargetRegistry.scan()
+	for _, descendant in Workspace:GetDescendants() do
+		if descendant.ClassName == "Humanoid" then
+			humanoids[descendant] = true
+		end
+	end
+end
+
+function TargetRegistry.all()
+	return humanoids
+end
+
+--------------------------------------------------------------------------------
+-- 5. TARGET SELECTOR
+--------------------------------------------------------------------------------
+local TargetSelector = {}
+
+TargetSelector.PartOptions = {
+	{ Label = "Cabeça", Kind = "Head" },
+	{ Label = "Pescoço", Kind = "Neck" },
+	{ Label = "Peito", Kind = "Chest" },
+}
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.RespectCanCollide = true
+
+local function findPart(model, name)
+	local part = model:FindFirstChild(name)
+	if part and part:IsA("BasePart") then
+		return part
+	end
+	return nil
+end
+
+-- Retorna (posição de mira, usouAlternativa). R15 e R6 são suportados.
+-- Cabeça: Head. Pescoço: junta Motor6D "Neck" (ou base da cabeça). Peito: UpperTorso (R15) / Torso (R6).
+function TargetSelector.resolveAimPoint(model, kind)
+	local head = findPart(model, "Head")
+	local chest = findPart(model, "UpperTorso") or findPart(model, "Torso")
+	local root = findPart(model, "HumanoidRootPart")
+
+	if kind == "Head" then
+		if head then
+			return head.Position, false
+		end
+	elseif kind == "Neck" then
+		if head then
+			local neck = head:FindFirstChild("Neck") or (chest and chest:FindFirstChild("Neck"))
+			if neck and neck:IsA("Motor6D") and neck.Part0 and neck.Part0:IsA("BasePart") then
+				return (neck.Part0.CFrame * neck.C0).Position, false
+			end
+			return (head.CFrame * Vector3.new(0, -head.Size.Y * 0.5, 0)), false
+		end
+	elseif kind == "Chest" then
+		if chest then
+			return chest.Position, false
+		end
+	end
+
+	-- modelo sem a parte pedida: usa a melhor alternativa disponível
+	local fallback = head or chest or root
+	if fallback then
+		return fallback.Position, true
+	end
+	return nil, false
+end
+
+local function isVisible(origin, aimPosition, model)
+	local result = Workspace:Raycast(origin, aimPosition - origin, rayParams)
+	return result == nil or result.Instance:IsDescendantOf(model)
+end
+
+-- Escolhe o melhor alvo usando a posição projetada na tela e a distância ao centro do FOV.
+-- Retorna: model, aimPosition, player(ou nil), usouAlternativa
+function TargetSelector.findBest(camera, currentModel)
+	local kind = TargetSelector.PartOptions[AimState.PartIndex].Kind
+	local limit = FovState.Enabled and FovState.Radius or math.huge
+	local origin = camera.CFrame.Position
+	local localCharacter = LocalPlayer.Character
+	rayParams.FilterDescendantsInstances = localCharacter and { localCharacter } or {}
+
+	local stats = SelectionStats
+	stats.Candidates, stats.InFov = 0, 0
+
+	local bestModel, bestPos, bestDist, bestPlayer, bestFallback
+	local currentPos, currentDist, currentPlayer, currentFallback
+
+	for humanoid in TargetRegistry.all() do
+		local model = humanoid.Parent
+		if model and model ~= localCharacter and humanoid.Health > 0 and model:IsDescendantOf(Workspace) then
+			local player = Players:GetPlayerFromCharacter(model)
+			local allowed
+			if player then
+				allowed = Config.TargetPlayers
+					and not (Config.IgnoreTeammates and player.Team ~= nil and player.Team == LocalPlayer.Team)
+			else
+				allowed = Config.TargetNPCs
+			end
+
+			if allowed then
+				stats.Candidates += 1
+				local pos, fellBack = TargetSelector.resolveAimPoint(model, kind)
+				if pos and (pos - origin).Magnitude <= Config.MaxDistance then
+					local dist = FovCalculator.distanceFromCenter(camera, pos)
+					if dist and dist <= limit then
+						stats.InFov += 1
+						if not Config.WallCheck or isVisible(origin, pos, model) then
+							if model == currentModel then
+								currentPos, currentDist, currentPlayer, currentFallback = pos, dist, player, fellBack
+							end
+							if not bestDist or dist < bestDist then
+								bestModel, bestPos, bestDist, bestPlayer, bestFallback = model, pos, dist, player, fellBack
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- histerese: evita alternar entre alvos parecidos
+	if currentPos and bestModel ~= currentModel and bestDist >= currentDist * Config.SwitchThreshold then
+		return currentModel, currentPos, currentPlayer, currentFallback
+	end
+	return bestModel, bestPos, bestPlayer, bestFallback
+end
+
+--------------------------------------------------------------------------------
+-- 6. CAMERA CONTROLLER (Aim Lock)
+--------------------------------------------------------------------------------
+local CameraController = {}
+
+local BIND_NAME = "AimAssistTestCamera"
+local bound = false
+
+function CameraController.bind(stepFunction)
+	if bound then
+		return
+	end
+	bound = true
+	-- Prioridade logo depois do script de câmera padrão (Camera = 200), para não ser sobrescrito por ele.
+	RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, stepFunction)
+end
+
+-- Remover o bind devolve a câmera ao script padrão no mesmo frame (CameraType nunca é alterado).
+function CameraController.unbind()
+	if not bound then
+		return
+	end
+	bound = false
+	RunService:UnbindFromRenderStep(BIND_NAME)
+end
+
+function CameraController.isBound()
+	return bound
+end
+
+-- Gira a câmera em direção a um ponto: suavização exponencial (independente de FPS, sem overshoot).
+function CameraController.aimAt(camera, targetPosition, dt, smoothness)
+	dt = math.min(dt, 0.1) -- evita salto grande após uma travada
+
+	local current = camera.CFrame
+	if (targetPosition - current.Position).Magnitude < 0.1 then
+		return
+	end
+
+	local desired = CFrame.lookAt(current.Position, targetPosition)
+	local cosAngle = math.clamp(current.LookVector:Dot(desired.LookVector), -1, 1)
+	local angle = math.acos(cosAngle)
+	if angle < math.rad(Config.DeadzoneDeg) then
+		return
+	end
+
+	local speed = Config.FastSpeed + (Config.SlowSpeed - Config.FastSpeed) * smoothness
+	local alpha = 1 - math.exp(-speed * dt)
+	alpha = math.min(alpha, (math.rad(Config.MaxTurnDegPerSecond) * dt) / angle, 1)
+
+	camera.CFrame = current:Lerp(desired, alpha)
+end
+
+--------------------------------------------------------------------------------
+-- 7. CAMERA FOV (visual) - separado do raio de seleção
+--------------------------------------------------------------------------------
+local CameraFov = {}
+local cameraFovConnection
+
+local function getCamera()
+	return Workspace.CurrentCamera
+end
+
+function CameraFov.apply()
+	local camera = getCamera()
+	if not camera then
+		return
+	end
+	local target = CameraFovState.Active and CameraFovState.Value or CameraFovState.Original
+	if math.abs(camera.FieldOfView - target) > 0.01 then
+		camera.FieldOfView = target
+	end
+end
+
+function CameraFov.set(value)
+	CameraFovState.Value = math.clamp(value, Config.MinCameraFov, Config.MaxCameraFov)
+	CameraFovState.Active = math.abs(CameraFovState.Value - CameraFovState.Original) > 0.5
+	CameraFov.apply()
+end
+
+-- Reaplica caso outro script mude o FOV enquanto o ajuste estiver ativo.
+function CameraFov.watch(camera)
+	if cameraFovConnection then
+		cameraFovConnection:Disconnect()
+	end
+	cameraFovConnection = camera:GetPropertyChangedSignal("FieldOfView"):Connect(function()
+		if CameraFovState.Active and math.abs(camera.FieldOfView - CameraFovState.Value) > 0.01 then
+			camera.FieldOfView = CameraFovState.Value
+		end
+	end)
+end
+
+--------------------------------------------------------------------------------
+-- 8. CLEAN GAME (reversível; não toca em física, velocidade nem mecânica)
+--------------------------------------------------------------------------------
+local CleanGame = {}
+
+local FX_CLASSES = {
+	ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true,
+}
+local POST_CLASSES = {
+	BloomEffect = true, BlurEffect = true, DepthOfFieldEffect = true, SunRaysEffect = true,
+}
+
+local savedEnabled = setmetatable({}, { __mode = "k" }) -- [instância] = Enabled original
+local savedProps = {}                                   -- {obj, prop, old}
+local lightingConnection
+local sweepToken = 0
+
+local function silence(instance)
+	if CollectionService:HasTag(instance, Config.Clean.KeepFxTag) then
+		return
+	end
+	if savedEnabled[instance] == nil then
+		savedEnabled[instance] = instance.Enabled
+	end
+	instance.Enabled = false
+end
+
+-- Chamado para cada instância nova enquanto o Clean Game estiver ativo.
+function CleanGame.handleInstance(instance)
+	local class = instance.ClassName
+	if FX_CLASSES[class] or POST_CLASSES[class] then
+		silence(instance)
+	end
+end
+
+local function overrideProperty(object, property, value)
+	local ok, old = pcall(function()
+		return object[property]
+	end)
+	if not ok then
+		return
+	end
+	table.insert(savedProps, { obj = object, prop = property, old = old })
+	pcall(function()
+		object[property] = value
+	end)
+end
+
+function CleanGame.enable()
+	sweepToken += 1
+	local token = sweepToken
+
+	-- 1) Propriedades rápidas (todas restauradas no disable)
+	overrideProperty(Lighting, "GlobalShadows", false)
+
+	local terrain = Workspace:FindFirstChildOfClass("Terrain")
+	if terrain then
+		overrideProperty(terrain, "Decoration", false)
+		overrideProperty(terrain, "WaterWaveSize", 0)
+		overrideProperty(terrain, "WaterReflectance", 0)
+	end
+
+	-- Nível gráfico apropriado ao dispositivo (só em sessão; não mexe nas configurações salvas do usuário)
+	local okRendering, rendering = pcall(function()
+		return settings().Rendering
+	end)
+	if okRendering and rendering then
+		local touchOnly = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+		local targetLevel = touchOnly and Config.Clean.MobileQuality or Config.Clean.DesktopQuality
+		local okLevel, currentLevel = pcall(function()
+			return rendering.QualityLevel
+		end)
+		if okLevel and (currentLevel.Value == 0 or currentLevel.Value > targetLevel.Value) then
+			overrideProperty(rendering, "QualityLevel", targetLevel)
+		end
+	end
+
+	-- 2) Pós-processamento existente e futuro
+	for _, child in Lighting:GetChildren() do
+		CleanGame.handleInstance(child)
+	end
+	local camera = getCamera()
+	if camera then
+		for _, child in camera:GetChildren() do
+			CleanGame.handleInstance(child)
+		end
+	end
+	lightingConnection = Lighting.ChildAdded:Connect(CleanGame.handleInstance)
+
+	-- 3) Partículas/trilhas/feixes já existentes: varredura em lotes para não travar o frame
+	task.spawn(function()
+		local list = Workspace:GetDescendants()
+		for index, instance in list do
+			if token ~= sweepToken then
+				return
+			end
+			CleanGame.handleInstance(instance)
+			if index % Config.Clean.SweepBatch == 0 then
+				task.wait()
+			end
+		end
+	end)
+end
+
+function CleanGame.disable()
+	sweepToken += 1 -- cancela varredura em andamento
+
+	if lightingConnection then
+		lightingConnection:Disconnect()
+		lightingConnection = nil
+	end
+
+	for instance, original in savedEnabled do
+		if instance.Parent then
+			pcall(function()
+				instance.Enabled = original
+			end)
+		end
+	end
+	table.clear(savedEnabled)
+
+	for index = #savedProps, 1, -1 do
+		local entry = savedProps[index]
+		pcall(function()
+			entry.obj[entry.prop] = entry.old
+		end)
+	end
+	table.clear(savedProps)
+end
+
+--------------------------------------------------------------------------------
+-- 9. CONTROL PANEL (UI)
+--------------------------------------------------------------------------------
+local ControlPanel = {}
+
+local COLORS = {
+	Panel = Color3.fromRGB(24, 26, 33),
+	Header = Color3.fromRGB(36, 39, 50),
+	Off = Color3.fromRGB(70, 74, 88),
+	On = Color3.fromRGB(46, 160, 90),
+	Accent = Color3.fromRGB(80, 140, 255),
+	Track = Color3.fromRGB(55, 58, 70),
+	Text = Color3.fromRGB(235, 237, 245),
+	SubText = Color3.fromRGB(170, 175, 190),
+	Circle = Color3.fromRGB(255, 255, 255),
+}
+
+local function make(className, props, parent)
+	local instance = Instance.new(className)
+	for key, value in props do
+		instance[key] = value
+	end
+	instance.Parent = parent
+	return instance
+end
+
+local function addCorner(parent, radius)
+	return make("UICorner", { CornerRadius = UDim.new(0, radius) }, parent)
+end
+
+local function isPointerStart(input)
+	return input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isPointerMove(dragInput, input)
+	if input == dragInput then
+		return true
+	end
+	return dragInput.UserInputType == Enum.UserInputType.MouseButton1
+		and input.UserInputType == Enum.UserInputType.MouseMovement
+end
+
+local function makeDraggable(handle, target, gui)
+	local dragInput, dragStart, startPos
+
+	handle.InputBegan:Connect(function(input)
+		if isPointerStart(input) then
+			dragInput = input
+			dragStart = input.Position
+			startPos = target.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End and dragInput == input then
+					dragInput = nil
+				end
+			end)
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if dragInput and isPointerMove(dragInput, input) then
+			local delta = input.Position - dragStart
+			local viewport = gui.AbsoluteSize
+			local size = target.AbsoluteSize
+			local x = math.clamp(startPos.X.Offset + delta.X, 0, math.max(viewport.X - size.X, 0))
+			local y = math.clamp(startPos.Y.Offset + delta.Y, 0, math.max(viewport.Y - size.Y, 0))
+			target.Position = UDim2.fromOffset(x, y)
+		end
+	end)
+end
+
+local function createRow(parent, order)
+	local row = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundTransparency = 1,
+		LayoutOrder = order,
+	}, parent)
+	make("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 6),
+	}, row)
+	return row
+end
+
+local function createToggle(row, order, onClick)
+	local button = make("TextButton", {
+		Size = UDim2.new(0.5, -3, 1, 0),
+		LayoutOrder = order,
+		BackgroundColor3 = COLORS.Off,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextScaled = true,
+		TextColor3 = COLORS.Text,
+		Text = "",
+		AutoButtonColor = true,
+	}, row)
+	make("UITextSizeConstraint", { MaxTextSize = 13, MinTextSize = 9 }, button)
+	addCorner(button, 8)
+	button.Activated:Connect(onClick)
+	return button
+end
+
+local function setToggleVisual(button, label, isOn)
+	button.Text = label .. ": " .. (isOn and "ON" or "OFF")
+	button.BackgroundColor3 = isOn and COLORS.On or COLORS.Off
+end
+
+local function createSlider(parent, order, labelText, min, max, initial, step, formatter, onChanged)
+	local row = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 44),
+		BackgroundTransparency = 1,
+		LayoutOrder = order,
+	}, parent)
+
+	local label = make("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 16),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextColor3 = COLORS.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "",
+	}, row)
+
+	-- área de toque maior que a barra visual (bom para celular)
+	local track = make("Frame", {
+		Position = UDim2.fromOffset(0, 20),
+		Size = UDim2.new(1, 0, 0, 24),
+		BackgroundTransparency = 1,
+		Active = true,
+	}, row)
+
+	local bar = make("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.new(1, 0, 0, 6),
+		BackgroundColor3 = COLORS.Track,
+		BorderSizePixel = 0,
+	}, track)
+	addCorner(bar, 3)
+
+	local fill = make("Frame", {
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = COLORS.Accent,
+		BorderSizePixel = 0,
+	}, bar)
+	addCorner(fill, 3)
+
+	local knob = make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.fromOffset(18, 18),
+		BackgroundColor3 = COLORS.Text,
+		BorderSizePixel = 0,
+	}, bar)
+	addCorner(knob, 9)
+
+	local function setValue(value, fire)
+		value = math.clamp(math.round(value / step) * step, min, max)
+		local alpha = (value - min) / (max - min)
+		fill.Size = UDim2.fromScale(alpha, 1)
+		knob.Position = UDim2.fromScale(alpha, 0.5)
+		label.Text = labelText .. ": " .. formatter(value)
+		if fire then
+			onChanged(value)
+		end
+	end
+
+	local function updateFromX(x)
+		local alpha = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+		setValue(min + (max - min) * alpha, true)
+	end
+
+	local dragInput
+	track.InputBegan:Connect(function(input)
+		if isPointerStart(input) then
+			dragInput = input
+			updateFromX(input.Position.X)
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End and dragInput == input then
+					dragInput = nil
+				end
+			end)
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if dragInput and isPointerMove(dragInput, input) then
+			updateFromX(input.Position.X)
+		end
+	end)
+
+	setValue(initial, false)
+end
+
+function ControlPanel.create(handlers)
+	local gui = make("ScreenGui", {
+		Name = "AimAssistTestGui",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true, -- mesmo sistema de coordenadas do WorldToViewportPoint
+		DisplayOrder = 50,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, PlayerGui)
+
+	-- Círculo de FOV de seleção (centralizado, não bloqueia toques)
+	local circle = make("Frame", {
+		Name = "FovCircle",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(FovState.Radius * 2, FovState.Radius * 2),
+		BackgroundTransparency = 1,
+		Active = false,
+		Visible = FovState.Enabled,
+	}, gui)
+	make("UICorner", { CornerRadius = UDim.new(1, 0) }, circle)
+	make("UIStroke", { Color = COLORS.Circle, Thickness = 2, Transparency = 0.25 }, circle)
+
+	-- Painel
+	local panel = make("Frame", {
+		Name = "Panel",
+		Position = UDim2.fromOffset(12, 64),
+		Size = UDim2.fromOffset(Config.PanelWidth, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = COLORS.Panel,
+		BorderSizePixel = 0,
+	}, gui)
+	addCorner(panel, 10)
+	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, panel)
+
+	-- Em telas baixas (celular na horizontal) o painel encolhe para caber
+	local uiScale = make("UIScale", {}, panel)
+	local function updateScale()
+		uiScale.Scale = math.clamp(gui.AbsoluteSize.Y / 520, 0.7, 1)
+	end
+	updateScale()
+	gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateScale)
+
+	local header = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundColor3 = COLORS.Header,
+		BorderSizePixel = 0,
+		LayoutOrder = 1,
+		Active = true,
+	}, panel)
+	addCorner(header, 10)
+
+	make("TextLabel", {
+		Size = UDim2.new(1, -40, 1, 0),
+		Position = UDim2.fromOffset(10, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextColor3 = COLORS.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "Teste de Mira (arraste)",
+	}, header)
+
+	local minimize = make("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -4, 0.5, 0),
+		Size = UDim2.fromOffset(28, 26),
+		BackgroundColor3 = COLORS.Off,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamBold,
+		TextSize = 16,
+		TextColor3 = COLORS.Text,
+		Text = "–",
+	}, header)
+	addCorner(minimize, 6)
+
+	local body = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = 2,
+	}, panel)
+	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, body)
+	make("UIPadding", {
+		PaddingTop = UDim.new(0, 8),
+		PaddingBottom = UDim.new(0, 8),
+		PaddingLeft = UDim.new(0, 10),
+		PaddingRight = UDim.new(0, 10),
+	}, body)
+
+	minimize.Activated:Connect(function()
+		body.Visible = not body.Visible
+		minimize.Text = body.Visible and "–" or "+"
+	end)
+
+	makeDraggable(header, panel, gui)
+
+	-- Linha 1: Aim Lock | FOV (seleção)    Linha 2: Parte | Clean Game
+	local row1 = createRow(body, 1)
+	local aimButton = createToggle(row1, 1, handlers.onToggleAim)
+	local fovButton = createToggle(row1, 2, handlers.onToggleFov)
+
+	local row2 = createRow(body, 2)
+	local partButton = createToggle(row2, 1, handlers.onCyclePart)
+	local cleanButton = createToggle(row2, 2, handlers.onToggleClean)
+
+	createSlider(body, 3, "Raio de seleção", Config.MinRadius, Config.MaxRadius, FovState.Radius, 1,
+		function(v) return string.format("%d px", v) end,
+		handlers.onRadiusChanged)
+
+	createSlider(body, 4, "Suavidade", 0, 1, AimState.Smoothness, 0.01,
+		function(v) return string.format("%d%%", math.round(v * 100)) end,
+		handlers.onSmoothnessChanged)
+
+	createSlider(body, 5, "FOV da câmera",
+		math.min(Config.MinCameraFov, CameraFovState.Original),
+		math.max(Config.MaxCameraFov, CameraFovState.Original),
+		CameraFovState.Value, 1,
+		function(v) return string.format("%d°", v) end,
+		handlers.onCameraFovChanged)
+
+	local statusLabel = make("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = 6,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextColor3 = COLORS.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextWrapped = true,
+		Text = "",
+	}, body)
+
+	local api = {}
+
+	function api.refresh()
+		setToggleVisual(aimButton, "Aim Lock", AimState.Enabled)
+		setToggleVisual(fovButton, "FOV", FovState.Enabled)
+		setToggleVisual(cleanButton, "Clean Game", CleanState.Enabled)
+		partButton.Text = "Parte: " .. TargetSelector.PartOptions[AimState.PartIndex].Label
+		partButton.BackgroundColor3 = COLORS.Off
+		circle.Visible = FovState.Enabled
+		circle.Size = UDim2.fromOffset(FovState.Radius * 2, FovState.Radius * 2)
+	end
+
+	function api.setStatus(text)
+		if statusLabel.Text ~= text then
+			statusLabel.Text = text
+		end
+	end
+
+	function api.isExpanded()
+		return body.Visible
+	end
+
+	api.refresh()
+	return api
+end
+
+--------------------------------------------------------------------------------
+-- 10. MAIN
+--------------------------------------------------------------------------------
+local ui
+
+local function onRenderStep(dt)
+	local camera = getCamera()
+	if not camera then
+		return
+	end
+
+	local model, pos, player, fellBack = TargetSelector.findBest(camera, AimState.TargetModel)
+
+	if Config.Debug and model ~= AimState.TargetModel then
+		print("[AimAssistTest] alvo:", model and model:GetFullName() or "nenhum")
+	end
+
+	AimState.TargetModel, AimState.TargetPos = model, pos
+	AimState.TargetPlayer, AimState.UsedFallback = player, fellBack or false
+
+	if pos then
+		CameraController.aimAt(camera, pos, dt, AimState.Smoothness)
+	end
+end
+
+local function setAimEnabled(enabled)
+	if AimState.Enabled == enabled then
+		return
+	end
+	AimState.Enabled = enabled
+
+	if enabled then
+		CameraController.bind(onRenderStep)
+	else
+		-- devolve imediatamente o controle normal da câmera
+		CameraController.unbind()
+		AimState.TargetModel, AimState.TargetPlayer, AimState.TargetPos = nil, nil, nil
+		AimState.UsedFallback = false
+	end
+	ui.refresh()
+end
+
+local function setCleanEnabled(enabled)
+	if CleanState.Enabled == enabled then
+		return
+	end
+	CleanState.Enabled = enabled
+	if enabled then
+		CleanGame.enable()
+	else
+		CleanGame.disable()
+	end
+	ui.refresh()
+end
+
+-- Ordem importa: câmera -> FOV original -> registro de alvos -> UI
+do
+	local camera = getCamera()
+	while not camera do
+		Workspace:GetPropertyChangedSignal("CurrentCamera"):Wait()
+		camera = getCamera()
+	end
+	CameraFovState.Original = camera.FieldOfView
+	CameraFovState.Value = camera.FieldOfView
+	CameraFov.watch(camera)
+end
+
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+	local camera = getCamera()
+	if camera then
+		CameraFov.watch(camera)
+		CameraFov.apply()
+	end
+end)
+
+TargetRegistry.scan()
+
+-- Um único listener de descendentes serve ao registro de alvos e ao Clean Game
+Workspace.DescendantAdded:Connect(function(instance)
+	local class = instance.ClassName
+	if class == "Humanoid" then
+		TargetRegistry.add(instance)
+	elseif CleanState.Enabled then
+		CleanGame.handleInstance(instance)
+	end
+end)
+
+Workspace.DescendantRemoving:Connect(function(instance)
+	if instance.ClassName == "Humanoid" then
+		TargetRegistry.remove(instance)
+	end
+end)
+
+ui = ControlPanel.create({
+	onToggleAim = function()
+		setAimEnabled(not AimState.Enabled)
+	end,
+	onToggleFov = function()
+		FovState.Enabled = not FovState.Enabled
+		ui.refresh()
+	end,
+	onCyclePart = function()
+		AimState.PartIndex = AimState.PartIndex % #TargetSelector.PartOptions + 1
+		ui.refresh()
+	end,
+	onToggleClean = function()
+		setCleanEnabled(not CleanState.Enabled)
+	end,
+	onRadiusChanged = function(value)
+		FovState.Radius = value
+		ui.refresh()
+	end,
+	onSmoothnessChanged = function(value)
+		AimState.Smoothness = value -- lido a cada frame pelo CameraController
+	end,
+	onCameraFovChanged = function(value)
+		CameraFov.set(value)
+	end,
+})
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if not gameProcessed and input.KeyCode == Config.ToggleKey then
+		setAimEnabled(not AimState.Enabled)
+	end
+end)
+
+-- FPS medido por Heartbeat (taxa real de quadros do cliente) + texto de estado (5x/s)
+local frames, fpsElapsed, statusElapsed, fps = 0, 0, 0, 0
+
+RunService.Heartbeat:Connect(function(dt)
+	frames += 1
+	fpsElapsed += dt
+	statusElapsed += dt
+
+	if fpsElapsed >= 0.5 then
+		fps = frames / fpsElapsed
+		frames, fpsElapsed = 0, 0
+	end
+
+	if statusElapsed < 0.2 or not ui.isExpanded() then
+		return
+	end
+	statusElapsed = 0
+
+	local camera = getCamera()
+	local lines = {}
+
+	if not AimState.Enabled then
+		table.insert(lines, "Aim Lock: desativado")
+	elseif AimState.TargetModel then
+		local name = AimState.TargetPlayer and AimState.TargetPlayer.DisplayName or AimState.TargetModel.Name
+		local partLabel = TargetSelector.PartOptions[AimState.PartIndex].Label
+		table.insert(lines, string.format("Aim Lock: ATIVO\nAlvo: %s (%s%s)", name, partLabel,
+			AimState.UsedFallback and ", alternativa" or ""))
+	else
+		table.insert(lines, "Aim Lock: ATIVO\nSem alvo válido")
+	end
+
+	if AimState.Enabled then
+		table.insert(lines, string.format("Candidatos: %d | No FOV: %d", SelectionStats.Candidates, SelectionStats.InFov))
+		if camera and camera.CameraType == Enum.CameraType.Scriptable then
+			table.insert(lines, "Aviso: câmera Scriptable (outro script pode sobrescrever)")
+		end
+	end
+
+	if camera then
+		if FovState.Enabled then
+			table.insert(lines, string.format("Seleção: %d px ≈ %.1f° | Câmera: %d°",
+				FovState.Radius, FovCalculator.radiusToDegrees(camera, FovState.Radius), math.round(camera.FieldOfView)))
+		else
+			table.insert(lines, string.format("Seleção: tela inteira | Câmera: %d°", math.round(camera.FieldOfView)))
+		end
+	end
+
+	table.insert(lines, string.format("FPS: %d (%.1f ms)", math.round(fps), fps > 0 and 1000 / fps or 0))
+	ui.setStatus(table.concat(lines, "\n"))
+end)
